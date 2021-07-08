@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-import { NotebookDocument, NotebookEditor, workspace, WorkspaceEdit, window } from 'vscode';
+import { NotebookDocument, NotebookEditor, workspace, WorkspaceEdit, window, NotebookCell } from 'vscode';
 import { createDeferred, isPromise } from '../../../common/utils/async';
 import { noop } from '../../../common/utils/misc';
 
@@ -19,17 +19,19 @@ import { noop } from '../../../common/utils/misc';
  * - We update output
  * - We update status after completion
  */
-const pendingCellUpdates = new WeakMap<NotebookDocument, Promise<unknown>>();
+const pendingCellUpdates = new WeakMap<NotebookDocument | NotebookCell, Promise<unknown>>();
 
 export async function chainWithPendingUpdates(
-    document: NotebookDocument,
+    documentOrCell: NotebookDocument | NotebookCell,
     update: (edit: WorkspaceEdit) => void | Promise<void>
 ): Promise<boolean> {
-    const notebook = document;
-    if (document.isClosed) {
+    const notebook = 'notebook' in documentOrCell ? documentOrCell.notebook : documentOrCell;
+    if (notebook.isClosed) {
         return true;
     }
-    const pendingUpdates = pendingCellUpdates.has(notebook) ? pendingCellUpdates.get(notebook)! : Promise.resolve();
+    const pendingUpdates = pendingCellUpdates.has(notebook)
+        ? pendingCellUpdates.get(documentOrCell)!
+        : Promise.resolve();
     const deferred = createDeferred<boolean>();
     const aggregatedPromise = pendingUpdates
         // We need to ensure the update operation gets invoked after previous updates have been completed.
@@ -41,13 +43,16 @@ export async function chainWithPendingUpdates(
             if (isPromise(result)) {
                 await result;
             }
+            if (edit.size === 0) {
+                return;
+            }
             await workspace.applyEdit(edit).then(
                 (result) => deferred.resolve(result),
                 (ex) => deferred.reject(ex)
             );
         })
         .catch(noop);
-    pendingCellUpdates.set(notebook, aggregatedPromise);
+    pendingCellUpdates.set(documentOrCell, aggregatedPromise);
     return deferred.promise;
 }
 
@@ -55,5 +60,6 @@ export function clearPendingChainedUpdatesForTests() {
     const editor: NotebookEditor | undefined = window.activeNotebookEditor;
     if (editor?.document) {
         pendingCellUpdates.delete(editor.document);
+        editor.document.getCells().forEach((cell) => pendingCellUpdates.delete(cell));
     }
 }

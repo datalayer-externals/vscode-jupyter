@@ -275,12 +275,20 @@ export class IPyWidgetMessageDispatcher implements IIPyWidgetMessageDispatcher {
         let message;
 
         if (!this.isUsingIPyWidgets) {
-            if (!message) {
+            // Minimize unnecessarily deserialization (that chews up unnecessary CPU when we have a lot of messages).
+            // Such as loops, widgets, etc.
+            const definitelyNotUsingWidgets =
+                typeof data === 'string' &&
+                !data.includes(WIDGET_MIMETYPE) &&
+                !data.includes(Identifiers.DefaultCommTarget);
+
+            if (!message && !definitelyNotUsingWidgets) {
                 message = this.deserialize(data as any) as any;
             }
 
             // Check for hints that would indicate whether ipywidgest are used in outputs.
             if (
+                !definitelyNotUsingWidgets &&
                 message.content &&
                 message.content.data &&
                 (message.content.data[WIDGET_MIMETYPE] || message.content.target_name === Identifiers.DefaultCommTarget)

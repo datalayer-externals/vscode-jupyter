@@ -46,7 +46,7 @@ export async function updateCellCode(cell: NotebookCell, text: string) {
 
 // Add a new cell with the given contents after the current
 export async function addNewCellAfter(cell: NotebookCell, text: string) {
-    await chainWithPendingUpdates(cell.notebook, (edit) => {
+    await chainWithPendingUpdates(cell, (edit) => {
         traceCellMessage(cell, 'Create new cell after current');
         const cellData = new NotebookCellData(NotebookCellKind.Code, text, cell.document.languageId);
         cellData.outputs = [];

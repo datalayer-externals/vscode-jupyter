@@ -255,7 +255,7 @@ export class CellExecution {
         traceCellMessage(this.cell, 'Completed with errors');
         this.sendPerceivedCellExecute();
 
-        await chainWithPendingUpdates(this.cell.notebook, async () => {
+        await chainWithPendingUpdates(this.cell, async () => {
             traceCellMessage(this.cell, 'Update with error state & output');
             await this.execution?.appendOutput([translateErrorOutput(createErrorOutput(error))]);
         });
@@ -556,7 +556,7 @@ export class CellExecution {
     ) {
         const converted = cellOutputToVSCCellOutput(output);
 
-        await chainWithPendingUpdates(this.cell.notebook, async () => {
+        await chainWithPendingUpdates(this.cell, async () => {
             if (this.cell.document.isClosed) {
                 return;
             }
@@ -678,7 +678,7 @@ export class CellExecution {
     }
     private async handleStreamMessage(msg: KernelMessage.IStreamMsg, clearState: RefBool) {
         // eslint-disable-next-line complexity
-        await chainWithPendingUpdates(this.cell.notebook, async () => {
+        await chainWithPendingUpdates(this.cell, async () => {
             traceCellMessage(this.cell, 'Update streamed output');
             let exitingCellOutputs = this.cell.outputs;
             // Possible execution of cell has completed (the task would have been disposed).
