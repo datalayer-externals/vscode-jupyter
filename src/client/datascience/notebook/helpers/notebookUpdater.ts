@@ -43,9 +43,6 @@ export async function chainWithPendingUpdates(
             if (isPromise(result)) {
                 await result;
             }
-            if (edit.size === 0) {
-                return;
-            }
             await workspace.applyEdit(edit).then(
                 (result) => deferred.resolve(result),
                 (ex) => deferred.reject(ex)
