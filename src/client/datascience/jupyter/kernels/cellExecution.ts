@@ -41,7 +41,6 @@ import {
     translateCellDisplayOutput,
     translateErrorOutput
 } from '../../notebook/helpers/helpers';
-import { chainWithPendingUpdates } from '../../notebook/helpers/notebookUpdater';
 import { IDataScienceErrorHandler, IJupyterSession, INotebook, INotebookExecutionLogger } from '../../types';
 import { isPythonKernelConnection } from './helpers';
 import { KernelConnectionMetadata, NotebookCellRunState } from './types';
@@ -118,6 +117,7 @@ export class CellExecution {
     private cancelHandled = false;
     private requestHandlerChain = Promise.resolve();
     private request: Kernel.IShellFuture<KernelMessage.IExecuteRequestMsg, KernelMessage.IExecuteReplyMsg> | undefined;
+    private pendingCellUpdates = Promise.resolve();
     private constructor(
         public readonly cell: NotebookCell,
         private readonly errorHandler: IDataScienceErrorHandler,
@@ -255,10 +255,8 @@ export class CellExecution {
         traceCellMessage(this.cell, 'Completed with errors');
         this.sendPerceivedCellExecute();
 
-        await chainWithPendingUpdates(this.cell, async () => {
-            traceCellMessage(this.cell, 'Update with error state & output');
-            await this.execution?.appendOutput([translateErrorOutput(createErrorOutput(error))]);
-        });
+        traceCellMessage(this.cell, 'Update with error state & output');
+        await this.execution?.appendOutput([translateErrorOutput(createErrorOutput(error))]);
 
         this.endCellTask('failed');
         this._completed = true;
@@ -468,7 +466,9 @@ export class CellExecution {
             // request.done resolves even before all iopub messages have been sent through.
             // Solution is to wait for all messages to get processed.
             traceCellMessage(this.cell, 'Wait for jupyter execution');
-            await Promise.all([request.done, this.requestHandlerChain]);
+            // Ensure we await on all pending updates, possible when next cell runs it needs to update
+            // output from this (previous) cell output.
+            await Promise.all([request.done, this.requestHandlerChain, this.pendingCellUpdates]);
             traceCellMessage(this.cell, 'Jupyter execution completed');
             await this.completedSuccessfully();
             traceCellMessage(this.cell, 'Executed successfully in executeCell');
@@ -501,7 +501,7 @@ export class CellExecution {
                 traceInfoIf(!!process.env.VSC_JUPYTER_LOG_KERNEL_OUTPUT, 'KernelMessage = ExecuteResult');
                 await this.handleExecuteResult(msg as KernelMessage.IExecuteResultMsg, clearState);
             } else if (jupyterLab.KernelMessage.isExecuteInputMsg(msg)) {
-                await this.handleExecuteInput(msg as KernelMessage.IExecuteInputMsg, clearState);
+                this.handleExecuteInput(msg as KernelMessage.IExecuteInputMsg, clearState);
             } else if (jupyterLab.KernelMessage.isStatusMsg(msg)) {
                 traceInfoIf(!!process.env.VSC_JUPYTER_LOG_KERNEL_OUTPUT, 'KernelMessage = StatusMessage');
                 // Status is handled by the result promise. While it is running we are active. Otherwise we're stopped.
@@ -524,7 +524,7 @@ export class CellExecution {
                 await this.handleUpdateDisplayDataMessage(msg);
             } else if (jupyterLab.KernelMessage.isClearOutputMsg(msg)) {
                 traceInfoIf(!!process.env.VSC_JUPYTER_LOG_KERNEL_OUTPUT, 'KernelMessage = CleanOutput');
-                await this.handleClearOutput(msg as KernelMessage.IClearOutputMsg, clearState);
+                this.handleClearOutput(msg as KernelMessage.IClearOutputMsg, clearState);
             } else if (jupyterLab.KernelMessage.isErrorMsg(msg)) {
                 traceInfoIf(!!process.env.VSC_JUPYTER_LOG_KERNEL_OUTPUT, 'KernelMessage = ErrorMessage');
                 await this.handleError(msg as KernelMessage.IErrorMsg, clearState);
@@ -555,40 +555,46 @@ export class CellExecution {
         clearState: RefBool
     ) {
         const converted = cellOutputToVSCCellOutput(output);
-
-        await chainWithPendingUpdates(this.cell, async () => {
-            if (this.cell.document.isClosed) {
-                return;
-            }
+        if (this.cell.document.isClosed) {
+            return;
+        }
+        this.pendingCellUpdates = this.pendingCellUpdates.finally(() => {
             traceCellMessage(this.cell, 'Update output');
-            // Clear if necessary
-            if (clearState.value) {
-                await this.execution?.clearOutput();
-                clearState.update(false);
-            }
-
             // Append to the data (we would push here but VS code requires a recreation of the array)
             // Possible execution of cell has completed (the task would have been disposed).
             // This message could have come from a background thread.
             // In such circumstances, create a temporary task & use that to update the output (only cell execution tasks can update cell output).
-            const task = this.execution || this.createTemporaryTask();
-            const promise = task?.appendOutput([converted]);
-            this.endTemporaryTask();
-            // await on the promise at the end, we want to minimize UI flickers.
-            // The way we update output of other cells is to use an existing task or a temporary task.
-            // When using temporary tasks, we end up updating the UI with no execution order and spinning icons.
-            // Doing this causes UI updates, removing the awaits will enure there's no time for ui updates.
-            if (promise) {
-                try {
-                    // When user clears cells, we could end up using an output that no longer exists.
-                    // Ignore such exceptions, next time we get an output its possible the outputs are now in sync.
-                    await promise;
-                } catch (ex) {
-                    // Don't crash the updates, just ignore & hope & pray things work.
-                    // This way (at a minimum) we have the errors logged and we try to get things working by ignoring errors that are beyond our control.
-                    traceError(`Failed to update cell ${this.cell.index}, ${this.cell.document.uri.toString()}`, ex);
-                }
+
+            // Clear if necessary
+            if (clearState.value) {
+                // No need to await on this, the next operation is an append output, awaiting on that,
+                // will result in vscode first clearning & then performing append.
+                this.clearOutput(this.execution).then(noop, noop);
+                clearState.update(false);
             }
+
+            const task = this.execution || this.createTemporaryTask();
+            if (!task) {
+                return;
+            }
+            const promise = task.appendOutput([converted]);
+            // await on the promise at the end (after ending the task), we want to minimize UI flickers
+            // This way, we update the output & immediately end the task, then VS Code only needs to update the output.
+            // Else if we await on the update, then VS Codes task will update the ui with progress indicators and then update again after the task is ended.
+            //
+            // When using temporary tasks, we end up updating the UI with no execution order and spinning icons.
+            // Doing this causes UI updates, removing the awaits prior to ending the task will enure there's no time for ui updates.
+            // I.e. create cell task, perform update, and end cell task (no awaits in between).
+            this.endTemporaryTask();
+
+            return promise.then(noop, (ex) => {
+                // When user clears cells, we could end up using an output that no longer exists.
+                // Ignore such exceptions, next time we get an output its possible the outputs are now in sync.
+                // There have been instances when VS Code would fail with updates.
+                // Don't crash the updates, just ignore & hope & pray things work.
+                // This way (at a minimum) we have the errors logged and we try to get things working by ignoring errors that are beyond our control.
+                traceError(`Failed to update cell ${this.cell.index}, ${this.cell.document.uri.toString()}`, ex);
+            });
         });
     }
 
@@ -667,7 +673,7 @@ export class CellExecution {
         }
     }
 
-    private async handleExecuteInput(msg: KernelMessage.IExecuteInputMsg, _clearState: RefBool) {
+    private handleExecuteInput(msg: KernelMessage.IExecuteInputMsg, _clearState: RefBool) {
         if (msg.content.execution_count && this.execution) {
             this.execution.executionOrder = msg.content.execution_count;
         }
@@ -678,7 +684,7 @@ export class CellExecution {
     }
     private async handleStreamMessage(msg: KernelMessage.IStreamMsg, clearState: RefBool) {
         // eslint-disable-next-line complexity
-        await chainWithPendingUpdates(this.cell, async () => {
+        this.pendingCellUpdates = this.pendingCellUpdates.finally(async () => {
             traceCellMessage(this.cell, 'Update streamed output');
             let exitingCellOutputs = this.cell.outputs;
             // Possible execution of cell has completed (the task would have been disposed).
@@ -690,7 +696,8 @@ export class CellExecution {
             const clearOutput = clearState.value;
             if (clearOutput) {
                 exitingCellOutputs = [];
-                await task?.clearOutput();
+                // No need to await, we have the output captured.
+                this.clearOutput(task).catch((ex) => traceError('Clear failed', ex));
                 clearState.update(false);
             }
             let promise: Thenable<void> | undefined;
@@ -748,10 +755,12 @@ export class CellExecution {
             }
 
             this.endTemporaryTask();
-            // await on the promise at the end, we want to minimize UI flickers.
-            // The way we update output of other cells is to use an existing task or a temporary task.
+            // await on the promise at the end (after ending the task), we want to minimize UI flickers
+            // This way, we update the output & immediately end the task, then VS Code only needs to update the output.
+            // Else if we await on the update, then VS Codes task will update the ui with progress indicators and then update again after the task is ended.
+            //
             // When using temporary tasks, we end up updating the UI with no execution order and spinning icons.
-            // Doing this causes UI updates, removing the awaits will enure there's no time for ui updates.
+            // Doing this causes UI updates, removing the awaits prior to ending the task will enure there's no time for ui updates.
             // I.e. create cell task, perform update, and end cell task (no awaits in between).
             if (promise) {
                 await promise;
@@ -770,7 +779,7 @@ export class CellExecution {
         await this.addToCellData(output, clearState);
     }
 
-    private async handleClearOutput(msg: KernelMessage.IClearOutputMsg, clearState: RefBool) {
+    private handleClearOutput(msg: KernelMessage.IClearOutputMsg, clearState: RefBool) {
         // If the message says wait, add every message type to our clear state. This will
         // make us wait for this type of output before we clear it.
         if (msg && msg.content.wait) {
@@ -781,12 +790,16 @@ export class CellExecution {
             // In such circumstances, create a temporary task & use that to update the output (only cell execution tasks can update cell output).
 
             // Clear all outputs and start over again.
-            const task = this.execution || this.createTemporaryTask();
-            await task?.clearOutput();
+            // No need to wait, we can await via chaning the promise.
+            this.pendingCellUpdates = this.pendingCellUpdates.finally(() =>
+                this.clearOutput(this.execution || this.createTemporaryTask())
+            );
             this.endTemporaryTask();
         }
     }
-
+    private async clearOutput(task?: NotebookCellExecution) {
+        await task?.clearOutput();
+    }
     private async handleError(msg: KernelMessage.IErrorMsg, clearState: RefBool) {
         const output: nbformat.IError = {
             output_type: 'error',
@@ -815,68 +828,76 @@ export class CellExecution {
      * Execution of Cell B could result in updates to output in Cell A.
      */
     private async handleUpdateDisplayDataMessage(msg: KernelMessage.IUpdateDisplayDataMsg): Promise<void> {
-        const document = this.cell.notebook;
-        // Find any cells that have this same display_id
-        for (const cell of document.getCells()) {
-            if (cell.kind !== NotebookCellKind.Code) {
-                continue;
-            }
+        // Await on the previous updates, could have cleared output or appended.
+        // Wait for model to be upto date.
+        const promise = (this.pendingCellUpdates = this.pendingCellUpdates.finally(async () => {
+            const document = this.cell.notebook;
+            // Find any cells that have this same display_id
+            for (const cell of document.getCells()) {
+                if (cell.kind !== NotebookCellKind.Code) {
+                    continue;
+                }
 
-            // Find the cell output that needs ot be updated.
-            const outputToBeUpdated = cell.outputs.find((cellOutput) => {
-                const output = translateCellDisplayOutput(cellOutput);
-                if (
-                    (output.output_type === 'display_data' || output.output_type === 'execute_result') &&
-                    output.transient &&
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    (output.transient as any).display_id === msg.content.transient.display_id
-                ) {
-                    return true;
-                } else {
-                    return false;
-                }
-            });
-            if (outputToBeUpdated) {
-                const output = translateCellDisplayOutput(outputToBeUpdated);
-                const newOutput = cellOutputToVSCCellOutput({
-                    ...output,
-                    data: msg.content.data,
-                    metadata: msg.content.metadata
-                });
-                // If there was no output and still no output, then nothing to do.
-                if (outputToBeUpdated.items.length === 0 && newOutput.items.length === 0) {
-                    return;
-                }
-                // Compare each output item (at the end of the day everything is serializable).
-                // Hence this is a safe comparison.
-                if (outputToBeUpdated.items.length === newOutput.items.length) {
-                    let allAllOutputItemsSame = true;
-                    for (let index = 0; index < cell.outputs.length; index++) {
-                        if (!fastDeepEqual(outputToBeUpdated.items[index], newOutput.items[index])) {
-                            allAllOutputItemsSame = false;
-                            break;
-                        }
+                // Find the cell output that needs ot be updated.
+                const outputToBeUpdated = cell.outputs.find((cellOutput) => {
+                    const output = translateCellDisplayOutput(cellOutput);
+                    if (
+                        (output.output_type === 'display_data' || output.output_type === 'execute_result') &&
+                        output.transient &&
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        (output.transient as any).display_id === msg.content.transient.display_id
+                    ) {
+                        return true;
+                    } else {
+                        return false;
                     }
-                    if (allAllOutputItemsSame) {
-                        // If everything is still the same, then there's nothing to update.
+                });
+                if (outputToBeUpdated) {
+                    const output = translateCellDisplayOutput(outputToBeUpdated);
+                    const newOutput = cellOutputToVSCCellOutput({
+                        ...output,
+                        data: msg.content.data,
+                        metadata: msg.content.metadata
+                    });
+                    // If there was no output and still no output, then nothing to do.
+                    if (outputToBeUpdated.items.length === 0 && newOutput.items.length === 0) {
                         return;
                     }
-                }
-                // Possible execution of cell has completed (the task would have been disposed).
-                // This message could have come from a background thread.
-                // In such circumstances, create a temporary task & use that to update the output (only cell execution tasks can update cell output).
-                const task = this.execution || this.createTemporaryTask();
-                const promise = task?.replaceOutputItems(newOutput.items, outputToBeUpdated);
-                this.endTemporaryTask();
-                // await on the promise at the end, we want to minimize UI flickers.
-                // The way we update output of other cells is to use an existing task or a temporary task.
-                // When using temporary tasks, we end up updating the UI with no execution order and spinning icons.
-                // Doing this causes UI updates, removing the awaits will enure there's no time for ui updates.
-                // I.e. create cell task, perform update, and end cell task (no awaits in between).
-                if (promise) {
+                    // Compare each output item (at the end of the day everything is serializable).
+                    // Hence this is a safe comparison.
+                    if (outputToBeUpdated.items.length === newOutput.items.length) {
+                        let allAllOutputItemsSame = true;
+                        for (let index = 0; index < cell.outputs.length; index++) {
+                            if (!fastDeepEqual(outputToBeUpdated.items[index], newOutput.items[index])) {
+                                allAllOutputItemsSame = false;
+                                break;
+                            }
+                        }
+                        if (allAllOutputItemsSame) {
+                            // If everything is still the same, then there's nothing to update.
+                            return;
+                        }
+                    }
+                    // Possible execution of cell has completed (the task would have been disposed).
+                    // This message could have come from a background thread.
+                    // In such circumstances, create a temporary task & use that to update the output (only cell execution tasks can update cell output).
+                    const task = this.execution || this.createTemporaryTask();
+                    if (!task) {
+                        continue;
+                    }
+                    const promise = task.replaceOutputItems(newOutput.items, outputToBeUpdated);
+                    this.endTemporaryTask();
+                    // await on the promise at the end (after ending the task), we want to minimize UI flickers
+                    // This way, we update the output & immediately end the task, then VS Code only needs to update the output.
+                    // Else if we await on the update, then VS Codes task will update the ui with progress indicators and then update again after the task is ended.
+                    //
+                    // When using temporary tasks, we end up updating the UI with no execution order and spinning icons.
+                    // Doing this causes UI updates, removing the awaits prior to ending the task will enure there's no time for ui updates.
+                    // I.e. create cell task, perform update, and end cell task (no awaits in between).
                     await promise;
                 }
             }
-        }
+        }));
+        await promise;
     }
 }
