@@ -12,7 +12,8 @@ import {
     NotebookEditor as VSCodeNotebookEditor,
     NotebookData,
     NotebookCellData,
-    NotebookCellKind
+    NotebookCellKind,
+    NotebookSerializer
 } from 'vscode';
 import { IApplicationShell, ICommandManager, IVSCodeNotebook } from '../../common/application/types';
 import '../../common/extensions';
@@ -183,6 +184,7 @@ export class NotebookEditorProvider implements INotebookEditorProvider {
         let editor = this.notebookEditorsByUri.get(uri.toString());
         if (!editor) {
             const notebookProvider = this.serviceContainer.get<INotebookProvider>(INotebookProvider);
+            const serializer = this.serviceContainer.get<NotebookSerializer>(NotebookSerializer);
             const kernelProvider = this.serviceContainer.get<IKernelProvider>(IKernelProvider);
             editor = new NotebookEditor(
                 doc,
