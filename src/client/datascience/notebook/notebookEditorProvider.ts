@@ -12,8 +12,7 @@ import {
     NotebookEditor as VSCodeNotebookEditor,
     NotebookData,
     NotebookCellData,
-    NotebookCellKind,
-    NotebookSerializer
+    NotebookCellKind
 } from 'vscode';
 import { IApplicationShell, ICommandManager, IVSCodeNotebook } from '../../common/application/types';
 import '../../common/extensions';
@@ -32,7 +31,7 @@ import { NotebookCellLanguageService } from './cellLanguageService';
 import { isJupyterNotebook } from './helpers/helpers';
 import { NotebookEditor } from './notebookEditor';
 import { PYTHON_LANGUAGE } from '../../common/constants';
-
+import { NotebookSerializer } from './notebookSerializer';
 /**
  * Notebook Editor provider used by other parts of DS code.
  * This is an adapter, that takes the VSCode api for editors (did notebook editors open, close save, etc) and
